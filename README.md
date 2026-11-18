@@ -35,7 +35,9 @@ page ── collector.js ──sendBeacon──▶ API Gateway (HTTP API)  POST 
 - `collector/collector.js`, the browser script you serve from your site.
 - API Gateway HTTP API `POST /e` with stage throttling and CORS for your
   origins; optional custom domain (ACM certificate + Route 53 alias).
-- The ingest Lambda (Python 3.12, arm64, reserved concurrency).
+- The ingest Lambda (Python 3.12, arm64, reserved concurrency; 512 MB and 15 s by
+  default, `lambda_memory_size` / `lambda_timeout`). Below 512 MB a cold start
+  can take ~5 s on Lambda's fractional CPU, and a beacon that times out is lost.
 - A Data Firehose stream: de-aggregation, dynamic partitioning by site, Parquet (SNAPPY).
 - An S3 bucket (public access blocked, SSE-S3, TLS only) with lifecycle expiry
   for events (default 90 days), Firehose errors and Athena results.
@@ -219,7 +221,7 @@ format-conversion and dynamic-partitioning rates marked * are estimates.
 | Line | Formula | 1k views/mo | 10k | 100k |
 |---|---|---|---|---|
 | API Gateway HTTP API | requests x $1.00/M | $0.003 | $0.03 | $0.30 |
-| Lambda arm64 128 MB, ~40 ms | requests x ($0.20 + $0.067)/M | $0.001 | $0.008 | $0.08 |
+| Lambda arm64 512 MB, ~40 ms | requests x ($0.20 + $0.27)/M | $0.001 | $0.014 | $0.14 |
 | Firehose ingest | requests x 5 KB x $0.029/GB | <$0.001 | $0.004 | $0.04 |
 | Firehose Parquet conversion* | same GB x $0.018/GB | <$0.001 | $0.003 | $0.03 |
 | Firehose dynamic partitioning* | GB x $0.02 + objects x $0.005/1k + JQ hours x $0.07 | ~$0.005 | ~$0.02 | ~$0.05 |
@@ -230,12 +232,12 @@ format-conversion and dynamic-partitioning rates marked * are estimates.
 | CloudWatch Logs | ~350 B/request x $0.50/GB | <$0.001 | $0.005 | $0.05 |
 | CloudWatch alarm (optional) | 1 x $0.10 | $0.10 | $0.10 | $0.10 |
 | KMS, ACM, Route 53 alias | none / free / free | $0 | $0 | $0 |
-| **Total** | | **~$0.12** | **~$0.19** | **~$0.68** |
+| **Total** | | **~$0.12** | **~$0.20** | **~$0.74** |
 | Athena add-on (optional) | queries x max(10 MB, scanned) x $5/TB | ~$0.01 | ~$0.01 | ~$0.05 |
 
 Worst case under a flood at the default throttle (5 req/s sustained, ~13M
-requests/month, max-size beacons): about $13 API Gateway + $3.50 Lambda +
-$22 Firehose + $2 logs = **~$40/month**, and the alarm fires within the hour.
+requests/month, max-size beacons): about $13 API Gateway + $6 Lambda +
+$22 Firehose + $2 logs = **~$43/month**, and the alarm fires within the hour.
 
 ## Tests
 
