@@ -229,8 +229,8 @@ resource "aws_lambda_function" "ingest" {
   handler                        = "ingest.handler"
   runtime                        = "python3.12"
   architectures                  = ["arm64"]
-  memory_size                    = 128
-  timeout                        = 5
+  memory_size                    = var.lambda_memory_size
+  timeout                        = var.lambda_timeout
   reserved_concurrent_executions = var.lambda_reserved_concurrency
   tags                           = var.tags
 
@@ -270,7 +270,9 @@ resource "aws_apigatewayv2_integration" "ingest" {
   integration_type       = "AWS_PROXY"
   integration_uri        = aws_lambda_function.ingest.invoke_arn
   payload_format_version = "2.0"
-  timeout_milliseconds   = 5000
+  # One second past the function timeout, so API Gateway never gives up on a
+  # call the function is still finishing.
+  timeout_milliseconds = min((var.lambda_timeout + 1) * 1000, 30000)
 }
 
 resource "aws_apigatewayv2_route" "ingest" {

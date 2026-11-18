@@ -104,6 +104,28 @@ variable "lambda_reserved_concurrency" {
   default     = 5
 }
 
+variable "lambda_memory_size" {
+  description = "Memory of the ingest function, in MB. Lambda CPU scales with memory; at 128 MB a cold start (Python init, SDK client, TLS to Firehose) took 4.5-5 s and timed out."
+  type        = number
+  default     = 512
+
+  validation {
+    condition     = var.lambda_memory_size >= 128 && var.lambda_memory_size <= 10240
+    error_message = "lambda_memory_size must be between 128 and 10240 MB."
+  }
+}
+
+variable "lambda_timeout" {
+  description = "Timeout of the ingest function, in seconds. The API Gateway integration timeout follows it (API Gateway allows at most 30 s)."
+  type        = number
+  default     = 15
+
+  validation {
+    condition     = var.lambda_timeout >= 3 && var.lambda_timeout <= 29
+    error_message = "lambda_timeout must be between 3 and 29 seconds (the HTTP API integration limit is 30 s)."
+  }
+}
+
 variable "max_body_bytes" {
   description = "Largest accepted beacon body, in bytes."
   type        = number

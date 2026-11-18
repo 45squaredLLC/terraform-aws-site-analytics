@@ -248,14 +248,18 @@ class HandlerTests(unittest.TestCase):
             self.assertEqual(ingest.handler(http_event(batch(), ua=ua))["statusCode"], 204)
         self.assertEqual(self.fh.calls, [])
 
-    def test_failed_put_retries_once(self):
+    def test_failed_put_is_503_without_a_second_handler_retry(self):
+        # Retries belong to botocore (bounded by _CLIENT_CONFIG), so a slow call
+        # cannot be repeated on top of the SDK's own retry and outrun the timeout.
         self.fh.fail_first = 1
-        self.assertEqual(ingest.handler(http_event(batch()))["statusCode"], 204)
-        self.assertEqual(len(self.fh.calls), 2)
-
-    def test_put_failing_twice_is_503(self):
-        self.fh.fail_first = 2
         self.assertEqual(ingest.handler(http_event(batch()))["statusCode"], 503)
+        self.assertEqual(len(self.fh.calls), 1)
+
+    def test_client_timeouts_fit_inside_the_function_timeout(self):
+        cfg = ingest._CLIENT_CONFIG
+        self.assertEqual(cfg["retries"], {"max_attempts": 2, "mode": "standard"})
+        worst = cfg["retries"]["max_attempts"] * (cfg["connect_timeout"] + cfg["read_timeout"])
+        self.assertLess(worst, 15)
 
     def test_garbage_body_is_400(self):
         self.assertEqual(ingest.handler(http_event("not json"))["statusCode"], 400)

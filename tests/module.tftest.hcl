@@ -72,6 +72,14 @@ run "core_only" {
     error_message = "CORS allows exactly the listed origins"
   }
   assert {
+    condition     = aws_lambda_function.ingest.memory_size == 512 && aws_lambda_function.ingest.timeout == 15
+    error_message = "ingest defaults to 512 MB / 15 s so a cold start fits"
+  }
+  assert {
+    condition     = aws_apigatewayv2_integration.ingest.timeout_milliseconds == 16000
+    error_message = "API Gateway waits one second past the function timeout"
+  }
+  assert {
     condition     = output.ingest_url == "https://abc123.execute-api.us-west-2.amazonaws.com/e"
     error_message = "ingest URL ends in /e"
   }

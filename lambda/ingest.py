@@ -27,6 +27,13 @@ import re
 import time
 from typing import Any
 
+try:  # The Lambda runtime ships boto3; the unit tests run without it.
+    import boto3
+    from botocore.config import Config
+except ImportError:  # pragma: no cover - exercised only outside Lambda
+    boto3 = None
+    Config = None
+
 SCHEMA_VERSION = 1
 
 EVENT_TYPES = frozenset({"pv", "click", "rage", "dead", "scroll", "leave"})
@@ -195,8 +202,28 @@ def parse_batch(
 
 # --------------------------------------------------------------------------- handler
 
+# Short network timeouts so one slow connection cannot use up the whole
+# function timeout; botocore's standard retry mode makes one more attempt.
+# Worst case: 2 x (2 s connect + 5 s read) plus backoff, inside the 15 s default.
+_CLIENT_CONFIG: dict[str, Any] = {
+    "connect_timeout": 2,
+    "read_timeout": 5,
+    "retries": {"max_attempts": 2, "mode": "standard"},
+}
+
+
+def _new_client() -> Any:
+    return boto3.client(
+        "firehose",
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        config=Config(**_CLIENT_CONFIG),
+    )
+
+
 _SITES: dict[str, dict[str, Any]] | None = None
-_FIREHOSE: Any = None
+# Built at import, in the Lambda init phase, so the SDK set-up is not billed
+# against (or timed out inside) the first request of a cold start.
+_FIREHOSE: Any = _new_client() if boto3 is not None and os.environ.get("STREAM_NAME") else None
 
 
 def _sites() -> dict[str, dict[str, Any]]:
@@ -209,9 +236,7 @@ def _sites() -> dict[str, dict[str, Any]]:
 def _firehose() -> Any:
     global _FIREHOSE
     if _FIREHOSE is None:
-        import boto3
-
-        _FIREHOSE = boto3.client("firehose", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        _FIREHOSE = _new_client()
     return _FIREHOSE
 
 
@@ -221,15 +246,16 @@ def put_records(client: Any, stream: str, records: list[dict[str, Any]]) -> int:
     Firehose bills each record rounded up to 5 KB, so one record per beacon
     (at most MAX_BODY_BYTES) instead of one per event cuts ingest cost by up to
     ~50x; the stream's RecordDeAggregation processor splits the lines again
-    before partitioning and Parquet conversion. Retries once. Returns events lost.
+    before partitioning and Parquet conversion. Retries (one, for throttling,
+    5xx and connect/read timeouts) are botocore's, bounded by _CLIENT_CONFIG.
+    Returns events lost.
     """
     data = "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in records).encode()
-    for _attempt in range(2):
-        try:
-            client.put_record(DeliveryStreamName=stream, Record={"Data": data})
-            return 0
-        except Exception as exc:  # noqa: BLE001 - boto3 raises many types; log the class only
-            _log(result="put_failed", error=type(exc).__name__)
+    try:
+        client.put_record(DeliveryStreamName=stream, Record={"Data": data})
+        return 0
+    except Exception as exc:  # noqa: BLE001 - boto3 raises many types; log the class only
+        _log(result="put_failed", error=type(exc).__name__)
     return len(records)
 
 
