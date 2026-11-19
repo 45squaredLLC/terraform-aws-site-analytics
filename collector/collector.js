@@ -25,6 +25,7 @@
   var RAGE_WINDOW_MS = 600;
   var RAGE_RADIUS_PX = 30;
   var DEAD_WAIT_MS = 1000;
+  var ROUTE_SETTLE_MS = 100;
   var FLUSH_MS = 5000;
   var MAX_QUEUE = 20;
   var MAX_CLICKS_PER_VIEW = 300;
@@ -235,6 +236,18 @@
     }
   }
 
+  /** One node is the other or contains it: a change in the clicked element's own area. */
+  function related(a, b) {
+    function holds(outer, inner) {
+      for (var d = 0; inner && d < 200; d++) {
+        if (inner === outer) return true;
+        inner = inner.parentElement;
+      }
+      return false;
+    }
+    return !!a && !!b && (holds(a, b) || holds(b, a));
+  }
+
   // ------------------------------------------------------------------ browser wiring
 
   function start(win, doc) {
@@ -262,16 +275,10 @@
     var sid = sessionValue(store, 'sa_sid', function () {
       return randomId('s', win.crypto);
     });
-    var pv = randomId('p', win.crypto);
-    var seq = 0;
+    // per page view; set by beginView()
+    var pv, path, ref, seq, clicks, maxDepth, marks, visibleMs, visibleSince, rage;
     var queue = [];
-    var clicks = 0;
-    var maxDepth = 0;
-    var marks = {};
-    var visibleMs = 0;
-    var visibleSince = doc.visibilityState === 'visible' ? Date.now() : 0;
-    var lastChange = 0;
-    var rage = new RageDetector();
+    var pending = []; // dead-click checks still inside DEAD_WAIT_MS
     var de = doc.documentElement;
 
     function docW() {
@@ -284,8 +291,8 @@
       var vw = win.innerWidth || de.clientWidth;
       return {
         v: VERSION, k: key, sid: sid, pv: pv,
-        p: win.location.pathname,
-        r: refHost(doc.referrer, win.location.hostname),
+        p: path,
+        r: ref,
         dev: deviceClass(vw),
         vw: vw, vh: win.innerHeight || de.clientHeight, dw: docW(), dh: docH()
       };
@@ -351,38 +358,94 @@
       if (!target || isInteractive(target)) return;
       var href = win.location.href;
       var scrolled = win.scrollY;
+      var view = pv;
       var dead = point(e, 'dead');
+      var check = { el: target, hit: false };
+      pending.push(check);
       win.setTimeout(function () {
+        pending.splice(pending.indexOf(check), 1);
         var sel = win.getSelection ? String(win.getSelection()) : '';
-        if (lastChange >= now || win.location.href !== href || win.scrollY !== scrolled || sel) return;
+        if (check.hit || target.isConnected === false || view !== pv ||
+            win.location.href !== href || win.scrollY !== scrolled || sel) return;
         push(dead);
       }, DEAD_WAIT_MS);
     }
-    function onHide() {
+    /** Close the current view. `measure` is false when the page may already show another route. */
+    function leave(measure) {
       if (visibleSince) {
         visibleMs += Date.now() - visibleSince;
         visibleSince = 0;
       }
-      onScroll();
+      if (measure) onScroll();
       push({ t: 'leave', depth: maxDepth, dur: visibleMs });
       flush();
     }
+    /** Start a page view: on load, and again when a single-page app changes the path. */
+    function beginView(route) {
+      var id = (pv = randomId('p', win.crypto));
+      path = win.location.pathname;
+      // a route change is a same-site navigation: no referrer, as on a multi-page site
+      ref = route ? '' : refHost(doc.referrer, win.location.hostname);
+      seq = 0;
+      clicks = 0;
+      marks = {};
+      visibleMs = 0;
+      visibleSince = doc.visibilityState === 'visible' ? Date.now() : 0;
+      rage = new RageDetector();
+      maxDepth = route ? 0 : depthNow();
+      var first = { t: 'pv', depth: maxDepth };
+      push(first);
+      if (!route) return;
+      // the router has not rendered or reset the scroll position yet: measure once it has
+      win.setTimeout(function () {
+        if (id !== pv) return;
+        first.depth = depthNow();
+        maxDepth = Math.max(maxDepth, first.depth);
+      }, ROUTE_SETTLE_MS);
+    }
+    /** Single-page apps: a new path is a new page view. Events so far go out under the old one. */
+    function onRoute() {
+      try {
+        if (win.location.pathname === path) return;
+        leave(false);
+        beginView(true);
+      } catch (e) { /* analytics never breaks the page */ }
+    }
+    function hookHistory(name) {
+      var h = win.history;
+      var orig = h && h[name];
+      if (typeof orig !== 'function') return;
+      h[name] = function () {
+        var out = orig.apply(this, arguments);
+        onRoute();
+        return out;
+      };
+    }
 
     if (win.MutationObserver) {
-      new win.MutationObserver(function () {
-        lastChange = Date.now();
+      // "The page reacted" means a change on the clicked element, inside it or on one of
+      // its ancestors. A carousel or animation elsewhere on the page does not count.
+      new win.MutationObserver(function (records) {
+        if (!pending.length) return;
+        for (var i = 0; i < records.length; i++) {
+          for (var j = 0; j < pending.length; j++) {
+            if (related(records[i].target, pending[j].el)) pending[j].hit = true;
+          }
+        }
       }).observe(de, { childList: true, subtree: true, attributes: true, characterData: false });
     }
-    maxDepth = depthNow();
-    push({ t: 'pv', depth: maxDepth });
+    beginView(false);
+    hookHistory('pushState');
+    hookHistory('replaceState');
+    win.addEventListener('popstate', onRoute);
     doc.addEventListener('click', onClick, { capture: true, passive: true });
     win.addEventListener('scroll', onScroll, { passive: true });
     doc.addEventListener('visibilitychange', function () {
-      if (doc.visibilityState === 'hidden') onHide();
+      if (doc.visibilityState === 'hidden') leave(true);
       else visibleSince = Date.now();
     });
     win.addEventListener('pagehide', function () {
-      if (visibleSince) onHide();
+      if (visibleSince) leave(true);
     });
     win.setInterval(flush, FLUSH_MS);
   }
@@ -398,6 +461,7 @@
     buildSelector: buildSelector,
     RageDetector: RageDetector,
     buildPayloads: buildPayloads,
+    related: related,
     sessionValue: sessionValue,
     start: start
   };

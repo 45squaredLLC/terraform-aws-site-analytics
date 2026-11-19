@@ -20,6 +20,9 @@ mock_provider "aws" {
   mock_resource "aws_kinesis_firehose_delivery_stream" {
     defaults = { arn = "arn:aws:firehose:us-west-2:123456789012:deliverystream/mock" }
   }
+  mock_resource "aws_ssm_parameter" {
+    defaults = { arn = "arn:aws:ssm:us-west-2:123456789012:parameter/site-analytics/sites" }
+  }
   mock_resource "aws_cloudwatch_log_group" {
     defaults = { arn = "arn:aws:logs:us-west-2:123456789012:log-group:mock" }
   }
@@ -64,8 +67,40 @@ run "core_only" {
   command = apply
 
   assert {
-    condition     = jsondecode(aws_lambda_function.ingest.environment[0].variables.SITES_JSON)["pk_example_01"].site == "example-com"
-    error_message = "SITES_JSON maps the public key to the site id"
+    condition     = jsondecode(aws_ssm_parameter.sites.value)["pk_example_01"].site == "example-com"
+    error_message = "the site list maps the public key to the site id"
+  }
+  assert {
+    condition     = aws_ssm_parameter.sites.name == "/site-analytics/sites" && aws_ssm_parameter.sites.type == "String" && aws_ssm_parameter.sites.tier == "Standard"
+    error_message = "the site list is one Standard String parameter under /<name>/"
+  }
+  assert {
+    condition     = aws_lambda_function.ingest.environment[0].variables.SITES_PARAM == "/site-analytics/sites" && aws_lambda_function.ingest.environment[0].variables.SITES_TTL_SECONDS == "300"
+    error_message = "the function is told which parameter to read and how long to cache it"
+  }
+  assert {
+    condition     = !contains(keys(aws_lambda_function.ingest.environment[0].variables), "SITES_JSON")
+    error_message = "the site list is no longer in the function's environment (4 KB cap)"
+  }
+  assert {
+    condition = one([
+      for s in data.aws_iam_policy_document.ingest.statement :
+      join(",", s.actions) == "ssm:GetParameter" && join(",", s.resources) == aws_ssm_parameter.sites.arn && s.effect != "Deny"
+      if s.sid == "ReadSiteList"
+    ])
+    error_message = "the ingest role may read exactly the one site-list parameter"
+  }
+  assert {
+    condition     = length([for s in data.aws_iam_policy_document.ingest.statement : s if anytrue([for a in s.actions : startswith(a, "ssm:")])]) == 1
+    error_message = "no other SSM permission on the ingest role"
+  }
+  assert {
+    condition     = aws_apigatewayv2_stage.default.default_route_settings[0].throttling_rate_limit == 5 && aws_apigatewayv2_stage.default.default_route_settings[0].throttling_burst_limit == 20
+    error_message = "the default throttle stays at 5 req/s, burst 20"
+  }
+  assert {
+    condition     = output.sites_parameter_name == "/site-analytics/sites"
+    error_message = "the parameter name is an output"
   }
   assert {
     condition     = length(aws_apigatewayv2_api.this.cors_configuration[0].allow_origins) == 3
@@ -157,6 +192,69 @@ run "rejects_duplicate_keys" {
     }
   }
   expect_failures = [var.sites]
+}
+
+# 40 sites: over Lambda's 4 KB environment cap, so the list needs an Advanced parameter.
+run "forty_sites_fit" {
+  command = apply
+  variables {
+    sites = { for i in range(40) : format("client-site-%02d-example-com", i) => {
+      key     = format("pk_client_site_%04d", i)
+      origins = [format("https://client-site-%02d.example.com", i), format("https://www.client-site-%02d.example.com", i)]
+    } }
+    sites_parameter_name  = "/team/analytics/sites"
+    sites_refresh_seconds = 60
+    throttle_rate_limit   = 25
+    throttle_burst_limit  = 50
+  }
+
+  assert {
+    condition     = length(aws_ssm_parameter.sites.value) > 4096 && aws_ssm_parameter.sites.tier == "Advanced"
+    error_message = "a list over 4 KB is stored as an Advanced parameter"
+  }
+  assert {
+    condition     = length(jsondecode(aws_ssm_parameter.sites.value)) == 40
+    error_message = "every site is in the list"
+  }
+  assert {
+    condition     = aws_ssm_parameter.sites.name == "/team/analytics/sites" && aws_lambda_function.ingest.environment[0].variables.SITES_PARAM == "/team/analytics/sites"
+    error_message = "sites_parameter_name is used for the parameter and passed to the function"
+  }
+  assert {
+    condition     = aws_lambda_function.ingest.environment[0].variables.SITES_TTL_SECONDS == "60"
+    error_message = "sites_refresh_seconds reaches the function"
+  }
+  assert {
+    condition     = aws_apigatewayv2_stage.default.default_route_settings[0].throttling_rate_limit == 25 && aws_apigatewayv2_stage.default.default_route_settings[0].throttling_burst_limit == 50
+    error_message = "throttle inputs reach the stage"
+  }
+}
+
+run "rejects_a_list_over_one_parameter" {
+  command = plan
+  variables {
+    sites = { for i in range(100) : format("client-site-%03d-example-com", i) => {
+      key     = format("pk_client_site_%04d", i)
+      origins = [format("https://client-site-%03d.example.com", i), format("https://www.client-site-%03d.example.com", i)]
+    } }
+  }
+  expect_failures = [aws_ssm_parameter.sites]
+}
+
+run "rejects_zero_throttle" {
+  command = plan
+  variables {
+    throttle_rate_limit = 0
+  }
+  expect_failures = [var.throttle_rate_limit]
+}
+
+run "rejects_bad_parameter_name" {
+  command = plan
+  variables {
+    sites_parameter_name = "site-analytics/sites"
+  }
+  expect_failures = [var.sites_parameter_name]
 }
 
 run "rejects_tiny_scan_cap" {

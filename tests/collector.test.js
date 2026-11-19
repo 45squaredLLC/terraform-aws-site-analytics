@@ -188,3 +188,268 @@ test('start() does nothing without a current script or under GPC', () => {
   c.start({ navigator: {} }, { currentScript: null });
   assert.deepEqual(calls, []);
 });
+
+// ---------------------------------------------------------------- start() in a fake browser
+
+// Just enough window/document for start(): timers and listeners are captured so a
+// test can fire them, and beacons are parsed instead of sent.
+function browser(opts = {}) {
+  const listeners = { win: {}, doc: {} };
+  const b = { beacons: [], timers: [], observer: null };
+  const html = el('html');
+  const body = el('body');
+  append(html, body);
+  Object.assign(html, { scrollWidth: 1440, clientWidth: 1440, scrollHeight: 3600, clientHeight: 900 });
+  body.scrollHeight = 3600;
+  const mem = {};
+  const location = { pathname: opts.path || '/', hostname: 'example.com', href: '' };
+  const go = (url) => {
+    const [p, q] = String(url).split('?');
+    location.pathname = p;
+    location.href = 'https://example.com' + p + (q ? '?' + q : '');
+  };
+  go(location.pathname);
+  b.win = {
+    innerWidth: 1440,
+    innerHeight: 900,
+    scrollY: 0,
+    location,
+    navigator: {
+      sendBeacon(url, payload) {
+        b.beacons.push(JSON.parse(payload));
+        return true;
+      },
+    },
+    history: {
+      calls: 0,
+      pushState(state, title, url) {
+        this.calls++;
+        go(url);
+        return 'pushed';
+      },
+      replaceState(state, title, url) {
+        this.calls++;
+        go(url);
+      },
+    },
+    sessionStorage: { getItem: (k) => mem[k] || null, setItem: (k, v) => { mem[k] = v; } },
+    getSelection: () => '',
+    setTimeout: (fn, ms) => b.timers.push({ fn, ms }),
+    setInterval: (fn) => { b.flush = fn; },
+    addEventListener: (type, fn) => { listeners.win[type] = fn; },
+    MutationObserver: class {
+      constructor(cb) {
+        this.cb = cb;
+        b.observer = this;
+      }
+      observe(node, options) {
+        this.options = options;
+      }
+    },
+  };
+  b.doc = {
+    currentScript: { getAttribute: (n) => ({ 'data-endpoint': 'https://v.example.com/e', 'data-key': 'pk_test_0001' })[n] || null },
+    documentElement: html,
+    body,
+    referrer: 'https://www.google.com/search?q=x',
+    visibilityState: 'visible',
+    addEventListener: (type, fn) => { listeners.doc[type] = fn; },
+  };
+  b.body = body;
+  b.go = go;
+  b.click = (target, x = 100, y = 300) => listeners.doc.click({ target, pageX: x, pageY: y });
+  b.scrollTo = (y) => {
+    b.win.scrollY = y;
+    listeners.win.scroll();
+  };
+  b.hide = () => {
+    b.doc.visibilityState = 'hidden';
+    listeners.doc.visibilitychange();
+  };
+  b.popstate = (url) => {
+    go(url);
+    listeners.win.popstate();
+  };
+  b.mutate = (...targets) => b.observer.cb(targets.map((target) => ({ target })));
+  b.runTimers = () => {
+    const due = b.timers.splice(0);
+    for (const t of due) t.fn();
+  };
+  b.events = () => b.beacons.flatMap((p) => p.e.map((e) => ({ ...e, p: p.p, pv: p.pv })));
+  c.start(b.win, b.doc);
+  return b;
+}
+
+test('multi-page site: one page view, path and referrer from the page, no history side effects', () => {
+  const b = browser({ path: '/pricing/' });
+  const link = el('a');
+  append(b.body, link);
+  b.click(link);
+  // same path, new query string: still the same page view
+  assert.equal(b.win.history.pushState({}, '', '/pricing/?tab=2'), 'pushed');
+  b.win.history.replaceState({}, '', '/pricing/?tab=3');
+  assert.equal(b.win.history.calls, 2, 'the original history functions still run');
+  b.scrollTo(900);
+  b.hide();
+  assert.equal(b.beacons.length, 1);
+  const p = b.beacons[0];
+  assert.equal(p.p, '/pricing/');
+  assert.equal(p.r, 'www.google.com');
+  assert.deepEqual([p.vw, p.vh, p.dw, p.dh, p.dev], [1440, 900, 1440, 3600, 'd']);
+  assert.deepEqual(p.e.map((e) => [e.t, e.seq]), [['pv', 0], ['click', 1], ['scroll', 2], ['scroll', 3], ['leave', 4]]);
+  assert.equal(p.e[0].depth, 25);
+  assert.equal(p.e[4].depth, 50);
+});
+
+test('single-page app: clicks are filed under the route they happened on', () => {
+  const b = browser({ path: '/a' });
+  const link = el('a');
+  append(b.body, link);
+  b.click(link);
+  // the route changes before the 5 s flush: the click must still go out under /a
+  b.win.history.pushState({}, '', '/b');
+  assert.equal(b.beacons.length, 1);
+  const first = b.beacons[0];
+  assert.equal(first.p, '/a');
+  assert.deepEqual(first.e.map((e) => e.t), ['pv', 'click', 'leave']);
+
+  b.click(link);
+  b.flush();
+  const second = b.beacons[1];
+  assert.equal(second.p, '/b');
+  assert.notEqual(second.pv, first.pv, 'a new page view id per route');
+  assert.match(second.pv, /^[A-Za-z0-9_-]{8,40}$/);
+  assert.equal(second.sid, first.sid, 'same tab session');
+  assert.equal(second.r, '', 'a route change has no external referrer');
+  assert.deepEqual(second.e.map((e) => [e.t, e.seq]), [['pv', 0], ['click', 1]]);
+});
+
+test('single-page app: replaceState and back/forward also start a new page view', () => {
+  const b = browser({ path: '/a' });
+  b.win.history.replaceState({}, '', '/b');
+  b.popstate('/a');
+  b.hide();
+  assert.deepEqual(b.beacons.map((p) => p.p), ['/a', '/b', '/a']);
+  assert.equal(new Set(b.beacons.map((p) => p.pv)).size, 3);
+});
+
+test('single-page app: scroll depth and marks start again on the new route', () => {
+  const b = browser({ path: '/a' });
+  b.scrollTo(2700); // bottom of /a
+  b.win.history.pushState({}, '', '/b');
+  // the router has not moved the scroll position yet; it does before the settle timer
+  b.win.scrollY = 0;
+  b.runTimers();
+  b.scrollTo(900);
+  b.hide();
+  const onB = b.events().filter((e) => e.p === '/b');
+  assert.deepEqual(onB.map((e) => [e.t, e.depth]), [['pv', 25], ['scroll', 25], ['scroll', 50], ['leave', 50]]);
+  const onA = b.events().filter((e) => e.p === '/a');
+  assert.equal(onA[onA.length - 1].depth, 100, '/a keeps its own depth');
+});
+
+test('single-page app: a pending dead-click check does not leak into the next route', () => {
+  const b = browser({ path: '/a' });
+  const p = el('p');
+  append(b.body, p);
+  b.click(p);
+  b.win.history.pushState({}, '', '/b');
+  b.runTimers();
+  b.hide();
+  assert.equal(b.events().filter((e) => e.t === 'dead').length, 0);
+});
+
+test('related: same node, ancestor or descendant only', () => {
+  const section = el('section');
+  const card = el('div');
+  const text = el('p');
+  const other = el('div');
+  append(section, card, other);
+  append(card, text);
+  assert.equal(c.related(text, text), true);
+  assert.equal(c.related(section, text), true);
+  assert.equal(c.related(text, section), true);
+  assert.equal(c.related(other, text), false);
+  assert.equal(c.related(null, text), false);
+});
+
+// A page with a text block and, elsewhere, a carousel that keeps changing.
+function pageWithCarousel() {
+  const b = browser();
+  const main = el('main');
+  const text = el('p');
+  const strong = el('strong');
+  const carousel = el('div', { cls: 'carousel' });
+  const slide = el('div', { cls: 'slide' });
+  append(b.body, main, carousel);
+  append(main, text);
+  append(text, strong);
+  append(carousel, slide);
+  const dead = () => {
+    b.runTimers();
+    b.hide();
+    return b.events().filter((e) => e.t === 'dead');
+  };
+  return { b, main, text, strong, carousel, slide, dead };
+}
+
+test('dead click: nothing changed, so it is dead', () => {
+  const { b, text, dead } = pageWithCarousel();
+  b.click(text);
+  const found = dead();
+  assert.equal(found.length, 1);
+  assert.equal(found[0].sel, 'main > p');
+});
+
+test('dead click: a running animation elsewhere does not hide it', () => {
+  const { b, text, carousel, slide, dead } = pageWithCarousel();
+  b.mutate(slide);
+  b.click(text);
+  // style/class changes on the slides and slides being swapped, all within the wait
+  b.mutate(slide, carousel, slide);
+  b.mutate(carousel);
+  assert.equal(dead().length, 1);
+});
+
+test('dead click: a change on the element, inside it or on an ancestor is a reaction', () => {
+  for (const pick of ['text', 'strong', 'main', 'body']) {
+    const page = pageWithCarousel();
+    page.b.click(page.text);
+    page.b.mutate(page.slide, pick === 'body' ? page.b.body : page[pick]);
+    assert.equal(page.dead().length, 0, pick);
+  }
+});
+
+test('dead click: clicking inside the animated area still counts its changes as a reaction', () => {
+  const { b, slide, carousel, dead } = pageWithCarousel();
+  b.click(slide);
+  b.mutate(carousel);
+  assert.equal(dead().length, 0);
+});
+
+test('dead click: the element being removed, a scroll or a navigation is a reaction', () => {
+  let page = pageWithCarousel();
+  page.b.click(page.text);
+  page.text.isConnected = false;
+  assert.equal(page.dead().length, 0, 'removed');
+
+  page = pageWithCarousel();
+  page.b.click(page.text);
+  page.b.win.scrollY = 400;
+  assert.equal(page.dead().length, 0, 'scrolled');
+
+  page = pageWithCarousel();
+  page.b.click(page.text);
+  page.b.go('/?opened=1');
+  assert.equal(page.dead().length, 0, 'navigated');
+});
+
+test('dead click: never reported for interactive elements, and the observer stays document-wide', () => {
+  const { b, main, dead } = pageWithCarousel();
+  const button = el('button');
+  append(main, button);
+  b.click(button);
+  assert.equal(dead().length, 0);
+  assert.equal(b.observer.options.childList && b.observer.options.subtree, true);
+  assert.equal(b.observer.options.characterData, false, 'page text is never observed');
+});

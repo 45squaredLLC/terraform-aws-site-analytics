@@ -40,6 +40,28 @@ variable "sites" {
   }
 }
 
+variable "sites_parameter_name" {
+  description = "SSM parameter that holds the site list for the ingest function (a String: site keys are public). Null = /<name>/sites."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.sites_parameter_name == null || can(regex("^/[A-Za-z0-9_./-]+$", var.sites_parameter_name))
+    error_message = "sites_parameter_name must start with / and use letters, digits, _ . / -."
+  }
+}
+
+variable "sites_refresh_seconds" {
+  description = "How long the ingest function caches the site list before reading the SSM parameter again. A site added or removed takes effect within this time, with no function deploy."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.sites_refresh_seconds >= 30 && var.sites_refresh_seconds <= 86400
+    error_message = "sites_refresh_seconds must be between 30 and 86400."
+  }
+}
+
 variable "bucket_name" {
   description = "S3 bucket for events and Athena results. Null = <name>-<account id>-<region>."
   type        = string
@@ -87,19 +109,29 @@ variable "projection_start_date" {
 }
 
 variable "throttle_rate_limit" {
-  description = "API Gateway steady-state requests per second for the ingest route (all clients together). Also the cost ceiling under abuse."
+  description = "API Gateway steady-state requests per second for the ingest route. One limit shared by every site in the stack, not per site: requests over it get a 429 and those beacons are lost. Also the cost ceiling under abuse. The default suits a few small sites; see \"Throttle\" in the README before adding many."
   type        = number
   default     = 5
+
+  validation {
+    condition     = var.throttle_rate_limit > 0
+    error_message = "throttle_rate_limit must be above 0."
+  }
 }
 
 variable "throttle_burst_limit" {
-  description = "API Gateway burst limit for the ingest route."
+  description = "API Gateway burst limit for the ingest route: how many requests can arrive at once before throttle_rate_limit applies. Shared by every site in the stack, like the rate."
   type        = number
   default     = 20
+
+  validation {
+    condition     = var.throttle_burst_limit > 0
+    error_message = "throttle_burst_limit must be above 0."
+  }
 }
 
 variable "lambda_reserved_concurrency" {
-  description = "Reserved concurrency of the ingest function: a hard cap on parallel ingest work. -1 = unreserved."
+  description = "Reserved concurrency of the ingest function: a hard cap on parallel ingest work. -1 = unreserved (needed in a new AWS account whose concurrency limit is still 10, where no function can reserve any)."
   type        = number
   default     = 5
 }

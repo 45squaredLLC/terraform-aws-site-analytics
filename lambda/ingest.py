@@ -5,11 +5,15 @@ API Gateway (HTTP API, payload v2) -> this function -> Amazon Data Firehose.
 Everything that arrives here is untrusted. The function fails closed:
 
 * POST only, body at most MAX_BODY_BYTES, JSON object only.
-* The public site key must be in the SITES allowlist, and the request's Origin
+* The public site key must be in the site allowlist, and the request's Origin
   header must be one of that site's origins. (Origin can be forged by a
   non-browser client; this is routing and abuse filtering, not authentication.
   The data is low value and insert-only: nothing here reads or changes stored
   events.)
+* The allowlist is one SSM parameter (SITES_PARAM), read in the init phase and
+  re-read every SITES_TTL_SECONDS. If it cannot be read or is malformed, every
+  beacon is rejected (503) until a read succeeds: never "accept everything",
+  and never an older copy of the list.
 * Every field is validated against a fixed schema. Unknown fields are dropped;
   a malformed envelope or event rejects the whole batch.
 * Known crawlers (by User-Agent) are accepted and discarded.
@@ -63,10 +67,10 @@ class Reject(Exception):
 
 
 def load_sites(raw: str) -> dict[str, dict[str, Any]]:
-    """SITES_JSON: {"<public key>": {"site": "<site id>", "origins": ["https://..."]}}."""
+    """The site list: {"<public key>": {"site": "<site id>", "origins": ["https://..."]}}."""
     data = json.loads(raw or "{}")
     if not isinstance(data, dict):
-        raise ValueError("SITES_JSON must be an object")
+        raise ValueError("the site list must be an object")
     sites: dict[str, dict[str, Any]] = {}
     for key, cfg in data.items():
         if not ID_RE.match(str(key)) or not isinstance(cfg, dict):
@@ -212,25 +216,105 @@ _CLIENT_CONFIG: dict[str, Any] = {
 }
 
 
-def _new_client() -> Any:
+# The site list is one small parameter and is re-read on at most one request
+# per SITES_TTL_SECONDS per container, so its budget is tighter still.
+_SSM_CONFIG: dict[str, Any] = {
+    "connect_timeout": 1,
+    "read_timeout": 2,
+    "retries": {"max_attempts": 2, "mode": "standard"},
+}
+
+SITES_TTL_DEFAULT = 300
+# After a failed read, wait this long before asking SSM again (requests in
+# between are rejected without a call), so an outage is not made worse.
+SITES_RETRY_SECONDS = 15
+
+
+def _new_client(service: str = "firehose", config: dict[str, Any] | None = None) -> Any:
     return boto3.client(
-        "firehose",
+        service,
         region_name=os.environ.get("AWS_REGION", "us-east-1"),
-        config=Config(**_CLIENT_CONFIG),
+        config=Config(**(config or _CLIENT_CONFIG)),
     )
 
 
+def _now() -> float:
+    return time.monotonic()
+
+
 _SITES: dict[str, dict[str, Any]] | None = None
+_SITES_FRESH_UNTIL = 0.0  # _now() value after which the parameter is read again
+_SITES_RETRY_AT = 0.0  # _now() value before which a failed read is not retried
 # Built at import, in the Lambda init phase, so the SDK set-up is not billed
 # against (or timed out inside) the first request of a cold start.
 _FIREHOSE: Any = _new_client() if boto3 is not None and os.environ.get("STREAM_NAME") else None
+_SSM: Any = (
+    _new_client("ssm", _SSM_CONFIG) if boto3 is not None and os.environ.get("SITES_PARAM") else None
+)
+
+
+def _ssm() -> Any:
+    global _SSM
+    if _SSM is None:
+        _SSM = _new_client("ssm", _SSM_CONFIG)
+    return _SSM
 
 
 def _sites() -> dict[str, dict[str, Any]]:
-    global _SITES
-    if _SITES is None:
-        _SITES = load_sites(os.environ.get("SITES_JSON", "{}"))
-    return _SITES
+    """The site allowlist, or Reject(503) when there is no trustworthy copy.
+
+    With SITES_PARAM set (how the module deploys it) the list is that SSM
+    parameter, cached for SITES_TTL_SECONDS. A failed or malformed read drops
+    the cached copy too: a site removed from the list must not keep being
+    accepted because SSM is unreachable. Without SITES_PARAM the list is the
+    SITES_JSON environment variable (local runs, v0.1.x deployments).
+    """
+    global _SITES, _SITES_FRESH_UNTIL, _SITES_RETRY_AT
+    name = os.environ.get("SITES_PARAM", "")
+    if not name:
+        if _SITES is None:
+            try:
+                _SITES = load_sites(os.environ.get("SITES_JSON", "{}"))
+            except (ValueError, TypeError):
+                _log(result="sites_unavailable", error="malformed")
+                raise Reject(503, "sites_unavailable") from None
+        return _SITES
+
+    now = _now()
+    if _SITES is not None and now < _SITES_FRESH_UNTIL:
+        return _SITES
+    if _SITES is None and now < _SITES_RETRY_AT:
+        raise Reject(503, "sites_unavailable")
+    try:
+        value = _ssm().get_parameter(Name=name)["Parameter"]["Value"]
+        sites = load_sites(value)
+    except Exception as exc:  # noqa: BLE001 - boto3 raises many types; log the class only
+        _SITES = None
+        _SITES_RETRY_AT = now + SITES_RETRY_SECONDS
+        _log(result="sites_unavailable", error=type(exc).__name__)
+        raise Reject(503, "sites_unavailable") from None
+    _SITES = sites
+    _SITES_FRESH_UNTIL = now + _ttl()
+    return sites
+
+
+def _ttl() -> int:
+    try:
+        return max(0, int(os.environ.get("SITES_TTL_SECONDS", SITES_TTL_DEFAULT)))
+    except ValueError:
+        return SITES_TTL_DEFAULT
+
+
+def _prime() -> None:
+    """Read the list in the init phase, so the first request does not pay for it.
+
+    A failure is not fatal here: the first request reads again and fails closed.
+    """
+    global _SITES_RETRY_AT
+    try:
+        _sites()
+    except Reject:
+        _SITES_RETRY_AT = 0.0
 
 
 def _firehose() -> Any:
@@ -296,3 +380,7 @@ def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:
     lost = put_records(_firehose(), os.environ["STREAM_NAME"], records)
     _log(result="accepted", site=site, events=len(records), lost=lost)
     return _response(204 if not lost else 503)
+
+
+if _SSM is not None:  # pragma: no cover - only inside Lambda
+    _prime()

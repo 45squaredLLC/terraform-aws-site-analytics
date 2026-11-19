@@ -36,6 +36,11 @@ output "ingest_function_name" {
   value       = aws_lambda_function.ingest.function_name
 }
 
+output "sites_parameter_name" {
+  description = "SSM parameter holding the site list the ingest function reads."
+  value       = aws_ssm_parameter.sites.name
+}
+
 output "reader_policy_json" {
   description = "IAM policy JSON for read-only access (S3 list/get on events/; plus Athena/Glue when enable_athena), to attach to your own role if you don't use create_reader."
   value       = data.aws_iam_policy_document.reader.json
