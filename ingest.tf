@@ -9,13 +9,41 @@
 # no Firehose integration, and a REST API's VTL mapping cannot check the Origin
 # against the key's own origin list, clamp/strip each field, or split a batch into
 # records cleanly. The function is ~200 lines with tests and costs cents at this
-# volume.
+# volume. The site list it checks against is an SSM parameter (below).
 
 locals {
   sites_json = jsonencode({
     for id, s in var.sites : s.key => { site = id, origins = [for o in s.origins : lower(o)] }
   })
   all_origins = sort(distinct(flatten([for s in values(var.sites) : [for o in s.origins : lower(o)]])))
+
+  sites_parameter_name = coalesce(var.sites_parameter_name, "/${var.name}/sites")
+  # SSM limits: a Standard parameter holds 4 KB, an Advanced one 8 KB.
+  sites_json_bytes = length(local.sites_json)
+}
+
+# --------------------------------------------------------------------------- site list
+
+# The allowlist the ingest function checks every beacon against. It lives in SSM
+# rather than in the function's environment: Lambda caps the whole environment at
+# 4 KB (about 30 sites), and a change here does not redeploy the function, which
+# re-reads the parameter every sites_refresh_seconds. A plain String on purpose:
+# site keys are public (they are in the page), so there is nothing to encrypt and
+# the function needs no KMS permission.
+resource "aws_ssm_parameter" "sites" {
+  name        = local.sites_parameter_name
+  description = "Site allowlist for ${var.name}-ingest: public key -> site id and allowed origins"
+  type        = "String"
+  tier        = local.sites_json_bytes > 4096 ? "Advanced" : "Standard"
+  value       = local.sites_json
+  tags        = var.tags
+
+  lifecycle {
+    precondition {
+      condition     = local.sites_json_bytes <= 8192
+      error_message = "sites: the site list is ${local.sites_json_bytes} bytes as JSON; one SSM parameter holds at most 8192 (about 60 sites). Split the sites across two stacks."
+    }
+  }
 }
 
 # --------------------------------------------------------------------------- Firehose
@@ -212,6 +240,12 @@ data "aws_iam_policy_document" "ingest" {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["${aws_cloudwatch_log_group.ingest.arn}:*"]
   }
+  # Exactly the one parameter, and GetParameter only (no path or batch reads).
+  statement {
+    sid       = "ReadSiteList"
+    actions   = ["ssm:GetParameter"]
+    resources = [aws_ssm_parameter.sites.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "ingest" {
@@ -236,10 +270,11 @@ resource "aws_lambda_function" "ingest" {
 
   environment {
     variables = {
-      STREAM_NAME    = aws_kinesis_firehose_delivery_stream.events.name
-      SITES_JSON     = local.sites_json
-      MAX_BODY_BYTES = tostring(var.max_body_bytes)
-      MAX_EVENTS     = tostring(var.max_events_per_batch)
+      STREAM_NAME       = aws_kinesis_firehose_delivery_stream.events.name
+      SITES_PARAM       = aws_ssm_parameter.sites.name
+      SITES_TTL_SECONDS = tostring(var.sites_refresh_seconds)
+      MAX_BODY_BYTES    = tostring(var.max_body_bytes)
+      MAX_EVENTS        = tostring(var.max_events_per_batch)
     }
   }
 

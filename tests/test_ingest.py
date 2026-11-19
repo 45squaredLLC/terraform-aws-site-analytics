@@ -205,11 +205,18 @@ class LoadSitesTests(unittest.TestCase):
                 ingest.load_sites(raw)
 
 
+def reset_site_cache():
+    ingest._SITES = None
+    ingest._SITES_FRESH_UNTIL = 0.0
+    ingest._SITES_RETRY_AT = 0.0
+
+
 class HandlerTests(unittest.TestCase):
     def setUp(self):
+        os.environ.pop("SITES_PARAM", None)
         os.environ["SITES_JSON"] = SITES_JSON
         os.environ["STREAM_NAME"] = "test-stream"
-        ingest._SITES = None
+        reset_site_cache()
         self.fh = FakeFirehose()
         ingest._FIREHOSE = self.fh
 
@@ -263,6 +270,175 @@ class HandlerTests(unittest.TestCase):
 
     def test_garbage_body_is_400(self):
         self.assertEqual(ingest.handler(http_event("not json"))["statusCode"], 400)
+
+    def test_malformed_env_list_rejects_everything(self):
+        os.environ["SITES_JSON"] = "{not json"
+        self.assertEqual(ingest.handler(http_event(batch()))["statusCode"], 503)
+        os.environ["SITES_JSON"] = "[]"
+        self.assertEqual(ingest.handler(http_event(batch()))["statusCode"], 503)
+        self.assertEqual(self.fh.calls, [])
+
+
+PARAM = "/site-analytics/sites"
+
+
+class FakeSsm:
+    """get_parameter only: the one call the ingest role is allowed to make."""
+
+    def __init__(self, value=SITES_JSON):
+        self.value = value
+        self.error = None
+        self.names = []
+
+    def get_parameter(self, Name, **kwargs):  # noqa: N803 - boto3 casing
+        self.names.append(Name)
+        if kwargs:
+            raise AssertionError(f"unexpected arguments {kwargs}")
+        if self.error:
+            raise self.error
+        return {"Parameter": {"Name": Name, "Type": "String", "Value": self.value}}
+
+
+class SiteListFromSsmTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["SITES_PARAM"] = PARAM
+        os.environ["SITES_TTL_SECONDS"] = "300"
+        os.environ["SITES_JSON"] = json.dumps(
+            {"pk_stale_0001": {"site": "stale", "origins": [ORIGIN]}}
+        )
+        os.environ["STREAM_NAME"] = "test-stream"
+        reset_site_cache()
+        self.fh = FakeFirehose()
+        self.ssm = FakeSsm()
+        ingest._FIREHOSE = self.fh
+        ingest._SSM = self.ssm
+        self.clock = 1000.0
+        self._real_now = ingest._now
+        ingest._now = lambda: self.clock
+
+    def tearDown(self):
+        ingest._now = self._real_now
+        ingest._SSM = None
+        for name in ("SITES_PARAM", "SITES_TTL_SECONDS"):
+            os.environ.pop(name, None)
+        reset_site_cache()
+
+    def post(self, **over):
+        return ingest.handler(http_event(batch(**over)))["statusCode"]
+
+    def test_list_comes_from_the_parameter_not_the_environment(self):
+        self.assertEqual(self.post(), 204)
+        self.assertEqual(self.post(k="pk_stale_0001"), 403)
+        self.assertEqual(self.ssm.names, [PARAM])
+
+    def test_list_is_cached_between_requests(self):
+        for _ in range(5):
+            self.assertEqual(self.post(), 204)
+            self.clock += 50
+        self.assertEqual(len(self.ssm.names), 1)
+
+    def test_list_is_read_again_after_the_ttl_so_a_new_site_needs_no_deploy(self):
+        self.assertEqual(self.post(k="pk_new_site_1"), 403)
+        new = json.loads(SITES_JSON)
+        new["pk_new_site_1"] = {"site": "new-site", "origins": ["https://new.example"]}
+        self.ssm.value = json.dumps(new)
+        self.clock += 299
+        resp = ingest.handler(http_event(batch(k="pk_new_site_1"), origin="https://new.example"))
+        self.assertEqual(resp["statusCode"], 403, "still the cached list")
+        self.clock += 2
+        resp = ingest.handler(http_event(batch(k="pk_new_site_1"), origin="https://new.example"))
+        self.assertEqual(resp["statusCode"], 204)
+        self.assertEqual(len(self.ssm.names), 2)
+
+    def test_removed_site_is_rejected_after_the_ttl(self):
+        self.assertEqual(self.post(), 204)
+        self.ssm.value = "{}"
+        self.clock += 301
+        self.assertEqual(self.post(), 403)
+
+    def test_unreadable_parameter_rejects_everything(self):
+        self.ssm.error = RuntimeError("AccessDeniedException")
+        self.assertEqual(self.post(), 503)
+        self.assertEqual(self.post(k="anything_goes"), 503)
+        self.assertEqual(self.fh.calls, [])
+
+    def test_malformed_parameter_rejects_everything(self):
+        for value in (
+            "{not json",
+            "[]",
+            '"*"',
+            "null",
+            '{"*": {"site": "all", "origins": ["*"]}}',
+            json.dumps({KEY: {"site": "example-com", "origins": []}}),
+            json.dumps({KEY: {"site": "example-com"}}),
+            json.dumps({KEY: "example-com"}),
+        ):
+            reset_site_cache()
+            self.ssm.value = value
+            self.assertEqual(self.post(), 503, value)
+        self.assertEqual(self.fh.calls, [])
+
+    def test_empty_list_accepts_nothing(self):
+        self.ssm.value = ""
+        self.assertEqual(self.post(), 403)
+        self.assertEqual(self.fh.calls, [])
+
+    def test_failed_refresh_drops_the_cached_list(self):
+        self.assertEqual(self.post(), 204)
+        self.ssm.error = RuntimeError("ThrottlingException")
+        self.clock += 301
+        self.assertEqual(self.post(), 503, "no stale list once a refresh has failed")
+        self.assertEqual(len(self.fh.calls), 1)
+
+    def test_failed_read_backs_off_then_recovers(self):
+        self.ssm.error = RuntimeError("ServiceUnavailable")
+        self.assertEqual(self.post(), 503)
+        self.clock += ingest.SITES_RETRY_SECONDS - 1
+        self.assertEqual(self.post(), 503)
+        self.assertEqual(len(self.ssm.names), 1, "no SSM call inside the back-off")
+        self.ssm.error = None
+        self.clock += 2
+        self.assertEqual(self.post(), 204)
+        self.assertEqual(len(self.ssm.names), 2)
+
+    def test_bots_and_bad_methods_never_read_the_parameter(self):
+        self.assertEqual(ingest.handler(http_event(batch(), ua="curl/8.0"))["statusCode"], 204)
+        self.assertEqual(ingest.handler(http_event(batch(), method="GET"))["statusCode"], 405)
+        self.assertEqual(self.ssm.names, [])
+
+    def test_init_read_fills_the_cache_and_a_failure_is_retried_by_the_first_request(self):
+        ingest._prime()
+        self.assertEqual(self.post(), 204)
+        self.assertEqual(len(self.ssm.names), 1, "the first request reuses the init read")
+
+        reset_site_cache()
+        self.ssm.error = RuntimeError("EndpointConnectionError")
+        ingest._prime()
+        self.ssm.error = None
+        self.assertEqual(self.post(), 204, "no back-off carried over from init")
+
+    def test_bad_ttl_falls_back_to_the_default(self):
+        os.environ["SITES_TTL_SECONDS"] = "soon"
+        self.assertEqual(ingest._ttl(), ingest.SITES_TTL_DEFAULT)
+
+    def test_reject_reason_and_error_class_are_logged_without_the_payload(self):
+        import contextlib
+        import io
+
+        self.ssm.error = RuntimeError("secret detail")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.post(), 503)
+        logged = out.getvalue()
+        self.assertIn('"reason":"sites_unavailable"', logged)
+        self.assertIn('"error":"RuntimeError"', logged)
+        self.assertNotIn("secret detail", logged)
+        self.assertNotIn(KEY, logged)
+
+    def test_ssm_budget_is_tighter_than_the_firehose_one(self):
+        cfg = ingest._SSM_CONFIG
+        worst = cfg["retries"]["max_attempts"] * (cfg["connect_timeout"] + cfg["read_timeout"])
+        self.assertLessEqual(worst, 6)
 
 
 if __name__ == "__main__":
