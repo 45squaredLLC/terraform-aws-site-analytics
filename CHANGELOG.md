@@ -5,6 +5,8 @@ All notable changes to this module are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-20
+
 ### Fixed
 
 - Collector, single-page apps: clicks were filed under the wrong path. The
