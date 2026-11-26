@@ -102,7 +102,7 @@ The endpoint is public by nature, so it fails closed:
 
 ```hcl
 module "site_analytics" {
-  source = "github.com/45squaredLLC/terraform-aws-site-analytics?ref=v0.1.0"
+  source = "github.com/45squaredLLC/terraform-aws-site-analytics?ref=v0.2.0"
 
   sites = {
     "example-com" = {
